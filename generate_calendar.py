@@ -46,6 +46,12 @@ BASE_URL = "https://www.nemenkom.lt/buitiniu-ir-pakuociu-atlieku-surinkimo-grafi
 VILLAGE = os.environ.get("ADDR_VILLAGE", "").strip()  # pvz. gyvenvietės fragmentas
 STREET = os.environ.get("ADDR_STREET", "").strip()    # pvz. gatvės pavadinimas
 
+# Atskiri raktai PDF failams (pakuotės/stiklas). Jei nenustatyti - naudojami
+# tie patys kaip XLSX. Reikalingi ten, kur tas pats kaimas kartojasi kitoje
+# seniūnijoje ir PDF blokai grupuojami kitaip nei XLSX eilutės.
+PDF_VILLAGE = os.environ.get("ADDR_PDF_VILLAGE", "").strip() or VILLAGE
+PDF_STREET = os.environ.get("ADDR_PDF_STREET", "").strip() or STREET
+
 MONTH_NAMES = {
     "sausio": 1, "sausis": 1, "vasario": 2, "vasaris": 2, "kovo": 3, "kovas": 3,
     "balandžio": 4, "balandis": 4, "gegužės": 5, "gegužis": 5, "birželio": 6, "birželis": 6,
@@ -160,6 +166,47 @@ def extract_pdf_text(content):
 # 1) PAKUOTĖS (PDF): adreso bloke yra jūsų gatvė, eilutė "Pakuotė N d. N d. N d."
 # --------------------------------------------------------------------------
 
+def parse_table_pdf(content, kind_label="Atliekos"):
+    """Bendras lentelinis PDF skaitytuvas (pakuotės ir stiklas).
+
+    Kiekviena lentelės eilutė = vienas adresų blokas, stulpeliai = mėnesiai.
+    Imame eilutę, kurios tekste yra ir PDF_VILLAGE (seniūnija), ir PDF_STREET
+    (kaimas). Taip neįmanoma pagauti gretimo bloko, kaip būdavo ieškant
+    artimiausio skaičiaus tekste.
+    """
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                month_cols = {}
+                for row in table:
+                    found = {}
+                    for ci, cell in enumerate(row or []):
+                        if cell:
+                            num = MONTH_NAMES.get(cell.replace("\n", " ").strip().lower())
+                            if num:
+                                found[ci] = num
+                    if len(found) >= 2:
+                        month_cols = found
+                        break
+                if not month_cols:
+                    continue
+
+                for row in table:
+                    text = " ".join((c or "").replace("\n", " ") for c in row)
+                    if PDF_VILLAGE not in text or PDF_STREET not in text:
+                        continue
+                    pairs = []
+                    for ci, cell in enumerate(row):
+                        if ci in month_cols and cell:
+                            for d in re.findall(r"(\d{1,2})\s*d", cell):
+                                pairs.append((month_cols[ci], int(d)))
+                    if pairs:
+                        return pairs
+
+    log_warning(f"{kind_label}: nerasta lentelės eilutė su jūsų seniūnija ir kaimu.")
+    return None
+
+
 def parse_pakuotes_pdf(content, kind_label="Pakuotės"):
     """Grąžina [(month_num, day), ...] arba None."""
     text = extract_pdf_text(content)
@@ -190,9 +237,9 @@ def parse_pakuotes_pdf(content, kind_label="Pakuotės"):
         return None
 
     best = None
-    for m in re.finditer(re.escape(STREET), text):
+    for m in re.finditer(re.escape(PDF_STREET), text):
         # patikra, kad tai tikrai jūsų gyvenvietės blokas (o ne kita gyvenvietė)
-        if VILLAGE not in text[max(0, m.start() - 1200): m.end() + 200]:
+        if PDF_VILLAGE not in text[max(0, m.start() - 1200): m.end() + 200]:
             continue
         street_pos = m.start()
         nearest = min(all_matches, key=lambda pm: abs(pm[0] - street_pos))
@@ -227,64 +274,52 @@ def _group_words_into_lines(words, tol=3.0):
 
 
 def parse_stiklas_pdf(content, kind_label="Stiklas"):
-    """Grąžina [(month_num, day)] (viena data) arba None."""
+    """Grąžina [(month_num, day), ...] arba None.
+
+    Stiklo PDF yra lentelė: kairėje - seniūnijos/kaimų blokas, dešinėje - po
+    stulpelį kiekvienam mėnesiui. Ieškome eilutės su savo kaimu (PDF_STREET),
+    patikriname, kad artimiausia "... sen." antraštė virš jos yra mūsų
+    (PDF_VILLAGE), ir skaičius paverčiame mėnesiais pagal x-poziciją.
+    """
+    pairs = []
     with pdfplumber.open(io.BytesIO(content)) as pdf:
-        pages_words = [p.extract_words() for p in pdf.pages]
+        for page in pdf.pages:
+            words = page.extract_words()
+            month_x = {}
+            for w in words:
+                num = MONTH_NAMES.get(w["text"].strip().lower())
+                if num:
+                    month_x.setdefault(num, w["x0"])
+            if len(month_x) < 2:
+                continue
 
-    # Mėnesių stulpelių x-centrai (antraštė kartojasi kiekviename puslapyje).
-    month_centers = {}  # month_num -> x_center
-    for words in pages_words:
-        for w in words:
-            key = w["text"].strip().lower()
-            if key in MONTH_NAMES:
-                month_centers[MONTH_NAMES[key]] = (w["x0"] + w["x1"]) / 2
-    if not month_centers:
-        log_warning(f"{kind_label}: nerasti mėnesių stulpeliai (antraštė) - PDF formatas pasikeitė.")
-        return None
+            lines = _group_words_into_lines(words)
+            for li, line in enumerate(lines):
+                text = " ".join(w["text"] for w in line["words"])
+                if not re.search(r"(^|\s)" + re.escape(PDF_STREET), text):
+                    continue
 
-    for words in pages_words:
-        for line in _group_words_into_lines(words):
-            t = line["text"]
-            # Mūsų grupė: gyvenvietė "(išskyrus kai kurias gatves)", kur jūsų
-            # gatvė NEišvardinta kaip išimtis -> vadinasi ji priklauso šiai grupei.
-            if VILLAGE in t and "išskyrus" in t and STREET not in t:
-                # Dienų skaičiai toje pačioje lentelės eilutėje (skaičiaus tekstas
-                # gali stovėti kelias pikseles aukščiau/žemiau už adreso tekstą).
-                # Kiekvieną skaičių priskiriame artimiausiam mėnesio stulpeliui,
-                # todėl veikia ir su viena, ir su keliomis stiklo datomis.
-                cands = [
-                    w for w in words
-                    if abs(w["top"] - line["top"]) < 20 and re.fullmatch(r"\d{1,2}", w["text"])
-                    # tik stulpelių zonoje (dešiniau už adreso tekstą)
-                    and w["x0"] > min(month_centers.values()) - 60
-                ]
-                if not cands:
-                    log_warning(f"{kind_label}: rasta jūsų grupė, bet nerasta dienos skaičiaus.")
-                    return None
+                # Artimiausia "sen." antraštė virš (arba pačioje) eilutėje.
+                sen_line = None
+                for back in range(li, max(-1, li - 8), -1):
+                    t = " ".join(w["text"] for w in lines[back]["words"])
+                    if " sen." in t:
+                        sen_line = t
+                        break
+                if sen_line is None or PDF_VILLAGE not in sen_line:
+                    continue
 
-                pairs = []
-                notes = []
-                for w in cands:
-                    cx = (w["x0"] + w["x1"]) / 2
-                    month_num, center = min(month_centers.items(), key=lambda kv: abs(kv[1] - cx))
-                    pair = (month_num, int(w["text"]))
-                    if pair not in pairs:
-                        pairs.append(pair)
-                        notes.append(f"{w['text']}(x={cx:.0f}->mėn.{month_num})")
-                log_note(
-                    f"{kind_label}: datos pagal x-poziciją stulpeliuose: "
-                    f"{', '.join(notes)}. Jei atrodo ne tas mėnuo - patikrinkite PDF vizualiai."
-                )
-                return pairs
+                for w in line["words"]:
+                    if not re.fullmatch(r"\d{1,2}", w["text"].strip()):
+                        continue
+                    best = min(month_x.items(), key=lambda kv: abs(kv[1] - w["x0"]))
+                    if abs(best[1] - w["x0"]) <= 40:
+                        pairs.append((best[0], int(w["text"])))
+                if pairs:
+                    return pairs
 
-    log_warning(f"{kind_label}: nerasta jūsų (išskyrus ...) grupė - PDF formatas pasikeitė arba adresas kitoje grupėje.")
+    log_warning(f"{kind_label}: nerasta jūsų eilutė su kaimu - PDF formatas pasikeitė?")
     return None
-
-
-# --------------------------------------------------------------------------
-# 3) BUITINĖS (XLSX): datos tekstu ("8d., 22d.,") po kelias per mėnesį,
-#    mėnesiai - stulpeliuose (Birželis ... Gruodis).
-# --------------------------------------------------------------------------
 
 def parse_buitines_xlsx(content, kind_label="Buitinės atliekos"):
     """Grąžina [(month_num, day), ...] arba None."""
@@ -421,8 +456,8 @@ def main():
     links = find_current_links()
     all_events = []
 
-    all_events += handle_category(links, "pakuotes", "Pakuočių atliekos", parse_pakuotes_pdf)
-    all_events += handle_category(links, "stiklas", "Stiklo atliekos", parse_stiklas_pdf)
+    all_events += handle_category(links, "pakuotes", "Pakuočių atliekos", parse_table_pdf)
+    all_events += handle_category(links, "stiklas", "Stiklo atliekos", parse_table_pdf)
 
     # Buitinės - XLSX (arba PDF, jei kada nors pasikeistų)
     if "buitines" not in links:
